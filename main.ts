@@ -7,7 +7,7 @@ interface SlideImage {
 
 export default class PPTSlidePaste extends Plugin {
   async onload() {
-    console.log("[PPT Paste] Plugin loaded v1.6.0");
+    console.log("[PPT Paste] Plugin loaded v1.7.0");
 
     this.registerEvent(
       this.app.workspace.on("editor-paste", (evt: ClipboardEvent, editor) => {
@@ -23,8 +23,9 @@ export default class PPTSlidePaste extends Plugin {
 
         const html = cd.getData("text/html");
         const rtf = cd.getData("text/rtf");
+        const svg = types.includes("image/svg+xml") ? cd.getData("image/svg+xml") : "";
 
-        // Collect File objects synchronously
+        // Collect File objects synchronously (before async)
         const collectedFiles: File[] = [];
         for (let i = 0; i < cd.items.length; i++) {
           if (cd.items[i].kind === "file") {
@@ -33,12 +34,10 @@ export default class PPTSlidePaste extends Plugin {
           }
         }
 
-        const hasMulti = this.hasMultipleImages(cd, html, rtf);
-
-        if (!isPpt && !hasMulti) return;
+        if (!isPpt && !this.hasMultipleImages(cd, html, rtf)) return;
 
         evt.preventDefault();
-        this.handlePaste(html, rtf, collectedFiles, isPpt, editor);
+        this.handlePaste(html, rtf, svg, collectedFiles, isPpt, editor);
       })
     );
   }
@@ -66,61 +65,73 @@ export default class PPTSlidePaste extends Plugin {
     return false;
   }
 
-  // ─── Main extraction ──────────────────────────────────────
+  // ─── Main Extraction Pipeline ──────────────────────────────
 
   private async handlePaste(
     html: string,
     rtf: string,
+    svg: string,
     collectedFiles: File[],
     isPpt: boolean,
     editor: any
   ) {
-    // ── Strategy 1: PowerShell COM automation (PPT only) ──
+    // ── S1: PowerShell COM automation (best: individual slide PNGs) ──
     if (isPpt) {
       new Notice("Extracting slides from PowerPoint...");
       const s1 = await this.fromPowerPointCOM();
-      console.log("[PPT Paste] S1 COM automation:", s1.length);
+      console.log("[PPT Paste] S1 COM:", s1.length);
       if (s1.length > 0) {
         await this.saveAndInsertImages(s1, editor);
         return;
       }
     }
 
-    // ── Fallback strategies ──
     const candidates: SlideImage[][] = [];
 
-    // S2: Collected image files
-    const imgFiles = await this.fromCollectedFiles(collectedFiles);
-    console.log("[PPT Paste] S2 files:", imgFiles.length);
-    candidates.push(imgFiles);
-
-    // S3: HTML base64
-    if (html) {
-      const s3 = this.fromBase64(html);
-      console.log("[PPT Paste] S3 HTML base64:", s3.length);
-      candidates.push(s3);
+    // ── S2: SVG embedded <image> tags with base64 ──
+    if (svg) {
+      const s2 = this.fromSvgEmbedded(svg);
+      console.log("[PPT Paste] S2 SVG embedded:", s2.length);
+      candidates.push(s2);
     }
 
-    // S4: HTML URLs
-    if (html) {
-      const s4 = await this.fromHtmlUrls(html);
-      console.log("[PPT Paste] S4 HTML URLs:", s4.length);
+    // ── S3: Collected clipboard files (SVG → PNG conversion) ──
+    const s3 = await this.fromCollectedFiles(collectedFiles);
+    console.log("[PPT Paste] S3 files:", s3.length);
+    candidates.push(s3);
+
+    // ── S4: SVG → Canvas → PNG render ──
+    if (svg && svg.length > 100) {
+      const s4 = await this.svgToPng(svg);
+      console.log("[PPT Paste] S4 SVG render:", s4.length);
       candidates.push(s4);
     }
 
-    // S5: RTF
-    if (rtf) {
-      const s5 = this.fromRtf(rtf);
-      console.log("[PPT Paste] S5 RTF:", s5.length);
+    // ── S5: HTML base64 data URIs ──
+    if (html) {
+      const s5 = this.fromBase64(html);
+      console.log("[PPT Paste] S5 base64:", s5.length);
       candidates.push(s5);
     }
 
-    let images = candidates.reduce(
+    // ── S6: HTML file:/// URLs ──
+    if (html) {
+      const s6 = await this.fromHtmlUrls(html);
+      console.log("[PPT Paste] S6 URLs:", s6.length);
+      candidates.push(s6);
+    }
+
+    // ── S7: RTF hex images ──
+    if (rtf) {
+      const s7 = this.fromRtf(rtf);
+      console.log("[PPT Paste] S7 RTF:", s7.length);
+      candidates.push(s7);
+    }
+
+    const images = candidates.reduce(
       (best, curr) => (curr.length > best.length ? curr : best),
       [] as SlideImage[]
     );
-
-    if (images.length === 0 && imgFiles.length > 0) images = imgFiles;
 
     console.log("[PPT Paste] Final:", images.length);
 
@@ -131,12 +142,8 @@ export default class PPTSlidePaste extends Plugin {
     }
   }
 
-  // ─── S1: PowerShell COM Automation ────────────────────────
+  // ─── S1: PowerShell COM Automation ─────────────────────────
 
-  /**
-   * Use PowerPoint's COM API to paste clipboard slides
-   * into a temp presentation and export each as PNG.
-   */
   private async fromPowerPointCOM(): Promise<SlideImage[]> {
     const images: SlideImage[] = [];
 
@@ -148,16 +155,28 @@ export default class PPTSlidePaste extends Plugin {
       const tempDir = path.join(os.tmpdir(), `ppt_slides_${Date.now()}`);
       const scriptPath = path.join(os.tmpdir(), `ppt_export_${Date.now()}.ps1`);
 
-      // PowerShell script: paste slides → export as PNG
+      // Key fix: wrap Visible in try-catch, add Quit() in finally
       const script = [
         "$ErrorActionPreference = 'Stop'",
         `$tempDir = '${tempDir.replace(/'/g, "''")}'`,
+        "$ppt = $null",
         "try {",
         "  $ppt = New-Object -ComObject PowerPoint.Application",
-        "  $ppt.Visible = $true",
+        "  try { $ppt.Visible = [int](-1) } catch { }",
         "  $pres = $ppt.Presentations.Add()",
-        "  $pres.Slides.Paste() | Out-Null",
+        "  try {",
+        "    $pres.Slides.Paste() | Out-Null",
+        "  } catch {",
+        "    try { $ppt.Visible = [int](-1) } catch { }",
+        "    Start-Sleep -Milliseconds 500",
+        "    $pres.Slides.Paste() | Out-Null",
+        "  }",
         "  $count = $pres.Slides.Count",
+        "  if ($count -eq 0) {",
+        "    $pres.Close()",
+        "    Write-Output 'ERR:No slides pasted'",
+        "    return",
+        "  }",
         "  New-Item -ItemType Directory -Path $tempDir -Force | Out-Null",
         "  for ($i = 1; $i -le $count; $i++) {",
         "    $p = Join-Path $tempDir ('slide_{0:D2}.png' -f $i)",
@@ -167,6 +186,11 @@ export default class PPTSlidePaste extends Plugin {
         "  Write-Output \"OK:$count\"",
         "} catch {",
         "  Write-Output \"ERR:$($_.Exception.Message)\"",
+        "} finally {",
+        "  if ($ppt) {",
+        "    try { $ppt.Quit() } catch { }",
+        "    try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ppt) | Out-Null } catch { }",
+        "  }",
         "}",
       ].join("\n");
 
@@ -186,13 +210,12 @@ export default class PPTSlidePaste extends Plugin {
             }
           } catch {}
         }
-        console.log("[PPT Paste] Exported", images.length, "slides");
+        console.log("[PPT Paste] Exported", images.length, "slides via COM");
       } else {
         console.log("[PPT Paste] PowerShell error:", result);
       }
 
-      // Cleanup
-      this.cleanup(fs, path, tempDir, scriptPath);
+      this.cleanupFiles(fs, path, tempDir, scriptPath);
     } catch (e: any) {
       console.log("[PPT Paste] COM error:", e?.message || e);
     }
@@ -205,11 +228,11 @@ export default class PPTSlidePaste extends Plugin {
       const { exec } = require("child_process");
       exec(
         `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
-        { timeout: 30000 },
+        { timeout: 60000 },
         (err: any, stdout: string, stderr: string) => {
           if (err) {
-            console.log("[PPT Paste] PS error:", err.message);
-            console.log("[PPT Paste] PS stderr:", stderr);
+            console.log("[PPT Paste] PS exec error:", err.message);
+            if (stderr) console.log("[PPT Paste] PS stderr:", stderr);
             resolve("ERR:" + (err.message || "unknown"));
           } else {
             resolve(stdout.trim());
@@ -219,7 +242,7 @@ export default class PPTSlidePaste extends Plugin {
     });
   }
 
-  private cleanup(fs: any, path: any, tempDir: string, scriptPath: string) {
+  private cleanupFiles(fs: any, path: any, tempDir: string, scriptPath: string) {
     try {
       if (fs.existsSync(tempDir)) {
         for (const f of fs.readdirSync(tempDir)) {
@@ -231,12 +254,43 @@ export default class PPTSlidePaste extends Plugin {
     try { fs.unlinkSync(scriptPath); } catch {}
   }
 
-  // ─── S2: Collected Files ──────────────────────────────────
+  // ─── S2: SVG Embedded <image> Tags ─────────────────────────
+
+  private fromSvgEmbedded(svg: string): SlideImage[] {
+    const images: SlideImage[] = [];
+    // PPT SVG may contain <image> with base64 href
+    const re = /(?:xlink:)?href=["']data:image\/([\w+]+);base64,([A-Za-z0-9+/=\s]+)["']/gi;
+    let m;
+    while ((m = re.exec(svg)) !== null) {
+      const b64 = m[2].replace(/\s/g, "");
+      try {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        if (bytes.length < 3000) continue;
+        images.push({ data: bytes, ext: this.extFromMime(`image/${m[1]}`) });
+      } catch {}
+    }
+    return images;
+  }
+
+  // ─── S3: Collected Clipboard Files ─────────────────────────
 
   private async fromCollectedFiles(files: File[]): Promise<SlideImage[]> {
     const images: SlideImage[] = [];
     for (const file of files) {
-      if (!file.type.startsWith("image/") || file.type === "image/svg+xml") continue;
+      if (!file.type.startsWith("image/")) continue;
+
+      // SVG → render to PNG via canvas
+      if (file.type === "image/svg+xml") {
+        try {
+          const text = await file.text();
+          const rendered = await this.svgToPng(text);
+          images.push(...rendered);
+        } catch {}
+        continue;
+      }
+
       try {
         const buf = await file.arrayBuffer();
         const data = new Uint8Array(buf);
@@ -247,7 +301,56 @@ export default class PPTSlidePaste extends Plugin {
     return images;
   }
 
-  // ─── S3: Base64 Data URIs ─────────────────────────────────
+  // ─── S4: SVG → Canvas → PNG ────────────────────────────────
+
+  private svgToPng(svgText: string): Promise<SlideImage[]> {
+    return new Promise((resolve) => {
+      try {
+        const blob = new Blob([svgText], { type: "image/svg+xml;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+
+        img.onload = () => {
+          try {
+            const w = Math.max(img.naturalWidth || 1920, 200);
+            const h = Math.max(img.naturalHeight || 1080, 200);
+            const canvas = document.createElement("canvas");
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext("2d");
+            if (!ctx) { URL.revokeObjectURL(url); resolve([]); return; }
+
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, 0, w, h);
+            ctx.drawImage(img, 0, 0, w, h);
+
+            canvas.toBlob(
+              (resultBlob) => {
+                URL.revokeObjectURL(url);
+                if (!resultBlob) { resolve([]); return; }
+                resultBlob.arrayBuffer().then((buf) => {
+                  const data = new Uint8Array(buf);
+                  if (data.length < 3000) { resolve([]); return; }
+                  resolve([{ data, ext: "png" }]);
+                }).catch(() => resolve([]));
+              },
+              "image/png"
+            );
+          } catch {
+            URL.revokeObjectURL(url);
+            resolve([]);
+          }
+        };
+
+        img.onerror = () => { URL.revokeObjectURL(url); resolve([]); };
+        img.src = url;
+      } catch {
+        resolve([]);
+      }
+    });
+  }
+
+  // ─── S5: HTML Base64 Data URIs ─────────────────────────────
 
   private fromBase64(text: string): SlideImage[] {
     const images: SlideImage[] = [];
@@ -266,7 +369,7 @@ export default class PPTSlidePaste extends Plugin {
     return images;
   }
 
-  // ─── S4: HTML URLs ────────────────────────────────────────
+  // ─── S6: HTML file:/// URLs ────────────────────────────────
 
   private async fromHtmlUrls(html: string): Promise<SlideImage[]> {
     const images: SlideImage[] = [];
@@ -288,7 +391,7 @@ export default class PPTSlidePaste extends Plugin {
     return images;
   }
 
-  // ─── S5: RTF ──────────────────────────────────────────────
+  // ─── S7: RTF Hex Images ────────────────────────────────────
 
   private fromRtf(rtf: string): SlideImage[] {
     const images: SlideImage[] = [];
@@ -348,7 +451,7 @@ export default class PPTSlidePaste extends Plugin {
     return null;
   }
 
-  // ─── Utilities ────────────────────────────────────────────
+  // ─── Utilities ─────────────────────────────────────────────
 
   private extFromMime(m: string): string {
     if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
