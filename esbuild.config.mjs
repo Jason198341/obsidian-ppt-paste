@@ -6,7 +6,7 @@ const prod = process.argv[2] === "production";
 esbuild.build({
   entryPoints: ["main.ts"],
   bundle: true,
-  external: ["obsidian", "electron", "fs", "path", "url", "@codemirror/autocomplete", "@codemirror/collab", "@codemirror/commands", "@codemirror/language", "@codemirror/lint", "@codemirror/search", "@codemirror/state", "@codemirror/view", "@lezer/common", "@lezer/highlight", "@lezer/lr"],
+  external: ["obsidian", "electron", "fs", "path", "url", "os", "child_process", "zlib", "@codemirror/autocomplete", "@codemirror/collab", "@codemirror/commands", "@codemirror/language", "@codemirror/lint", "@codemirror/search", "@codemirror/state", "@codemirror/view", "@lezer/common", "@lezer/highlight", "@lezer/lr"],
   format: "cjs",
   target: "es2018",
   logLevel: "info",
