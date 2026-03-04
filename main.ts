@@ -1,115 +1,200 @@
 import { Plugin, Notice, TFile, normalizePath } from "obsidian";
 
+interface SlideImage {
+  data: Uint8Array;
+  ext: string;
+}
+
 export default class PPTSlidePaste extends Plugin {
   async onload() {
     this.registerEvent(
       this.app.workspace.on("editor-paste", (evt: ClipboardEvent, editor) => {
         if (!evt.clipboardData) return;
 
-        // Strategy 1: Check text/html for multiple embedded base64 images (PPT's format)
-        const html = evt.clipboardData.getData("text/html");
-        if (html) {
-          const base64Images = this.extractBase64Images(html);
-          if (base64Images.length > 1) {
-            // Multiple images in HTML — this is PPT multi-slide paste
-            evt.preventDefault();
-            this.saveAndInsertImages(base64Images, editor);
-            return;
-          }
-        }
+        const cd = evt.clipboardData;
+        const html = cd.getData("text/html");
+        const rtf = cd.getData("text/rtf");
 
-        // Strategy 2: Check text/rtf — PPT also embits images in RTF
-        const rtf = evt.clipboardData.getData("text/rtf");
-        if (rtf) {
-          const rtfImages = this.extractRtfImages(rtf);
-          if (rtfImages.length > 1) {
-            evt.preventDefault();
-            this.saveAndInsertImages(rtfImages, editor);
-            return;
-          }
-        }
+        // Synchronous detection — must decide before event propagates
+        if (!this.hasMultipleImages(cd, html, rtf)) return;
 
-        // Strategy 3: Fallback — if HTML had exactly 1 image and there's also
-        // a blob, just let Obsidian handle it normally (single image paste)
+        evt.preventDefault();
+        this.extractAndInsert(cd, html, rtf, editor);
       })
     );
   }
 
   /**
-   * Extract base64-encoded images from HTML clipboard content.
-   * PPT puts <img src="data:image/png;base64,..."> or
-   * <v:imagedata src="data:image/png;base64,..."> for each slide.
+   * Synchronous quick-check: does the clipboard likely contain multiple slide images?
+   * Checks all possible sources without heavy parsing.
    */
-  private extractBase64Images(html: string): { data: Uint8Array; ext: string }[] {
-    const images: { data: Uint8Array; ext: string }[] = [];
+  private hasMultipleImages(cd: DataTransfer, html: string, rtf: string): boolean {
+    // Check 1: Multiple image files in clipboard
+    let fileCount = 0;
+    for (let i = 0; i < cd.files.length; i++) {
+      if (cd.files[i].type.startsWith("image/") && cd.files[i].size >= 3000) fileCount++;
+    }
+    if (fileCount > 1) return true;
 
-    // Match data URI patterns: data:image/TYPE;base64,DATA
-    // These appear in src="..." or src='...'
-    const regex = /data:image\/(png|jpeg|jpg|gif|bmp|webp|emf|wmf);base64,([A-Za-z0-9+/=\s]+)/g;
+    // Check 2: Multiple <img> tags or data URIs in HTML
+    if (html) {
+      const imgTags = (html.match(/<img[\s>]/gi) || []).length;
+      if (imgTags > 1) return true;
+
+      const dataUris = (html.match(/data:image\/[\w+]+;base64,/gi) || []).length;
+      if (dataUris > 1) return true;
+
+      // Check for multiple file:// or blob: image references
+      const fileRefs = (html.match(/src=["'](?:file:\/\/\/|blob:)[^"']*\.(?:png|jpg|jpeg|gif|bmp|emf|wmf)/gi) || []).length;
+      if (fileRefs > 1) return true;
+
+      // Check for VML imagedata tags (PPT uses these)
+      const vmlImages = (html.match(/<v:imagedata[\s>]/gi) || []).length;
+      if (vmlImages > 1) return true;
+    }
+
+    // Check 3: Multiple image markers in RTF
+    if (rtf) {
+      const rtfImages = (rtf.match(/\\(pngblip|jpegblip|emfblip)/g) || []).length;
+      if (rtfImages > 1) return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Async extraction — try all strategies, use the one that yields the most images.
+   */
+  private async extractAndInsert(cd: DataTransfer, html: string, rtf: string, editor: any) {
+    const candidates: SlideImage[][] = [];
+
+    // Strategy 1: Clipboard files (most reliable on Windows)
+    candidates.push(await this.fromFiles(cd));
+
+    // Strategy 2: HTML data: URIs (base64)
+    if (html) candidates.push(this.fromHtmlBase64(html));
+
+    // Strategy 3: HTML file:///blob: URLs (PPT temp files)
+    if (html) candidates.push(await this.fromHtmlUrls(html));
+
+    // Strategy 4: RTF embedded images
+    if (rtf) candidates.push(this.fromRtf(rtf));
+
+    // Pick the strategy that found the most images
+    const images = candidates.reduce(
+      (best, curr) => (curr.length > best.length ? curr : best),
+      [] as SlideImage[]
+    );
+
+    if (images.length > 0) {
+      await this.saveAndInsertImages(images, editor);
+    } else {
+      new Notice("Could not extract slide images from clipboard");
+    }
+  }
+
+  // ─── Strategy 1: Clipboard Files ───────────────────────────
+
+  private async fromFiles(cd: DataTransfer): Promise<SlideImage[]> {
+    const images: SlideImage[] = [];
+    for (let i = 0; i < cd.files.length; i++) {
+      const file = cd.files[i];
+      if (!file.type.startsWith("image/")) continue;
+      try {
+        const buf = await file.arrayBuffer();
+        const data = new Uint8Array(buf);
+        if (data.length < 3000) continue;
+        images.push({ data, ext: this.extFromMime(file.type) });
+      } catch { /* skip */ }
+    }
+    return images;
+  }
+
+  // ─── Strategy 2: HTML Base64 Data URIs ─────────────────────
+
+  private fromHtmlBase64(html: string): SlideImage[] {
+    const images: SlideImage[] = [];
+    const regex = /data:image\/([\w+]+);base64,([A-Za-z0-9+/=\s]+)/g;
     let match;
 
     while ((match = regex.exec(html)) !== null) {
-      const mimeSubtype = match[1];
+      const mimeType = match[1];
       const b64 = match[2].replace(/\s/g, "");
-
       try {
         const binary = atob(b64);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) {
           bytes[i] = binary.charCodeAt(i);
         }
-
-        // Skip tiny images (likely icons/bullets, not slides)
-        if (bytes.length < 5000) continue;
-
-        const ext = (mimeSubtype === "jpeg" || mimeSubtype === "jpg") ? "jpg" : "png";
-        images.push({ data: bytes, ext });
-      } catch {
-        // Invalid base64, skip
-      }
+        if (bytes.length < 3000) continue;
+        images.push({ data: bytes, ext: this.extFromMime(`image/${mimeType}`) });
+      } catch { /* skip */ }
     }
 
     return images;
   }
 
-  /**
-   * Extract images embedded in RTF content.
-   * RTF embeds images as hex-encoded data after \pngblip or \jpegblip
-   */
-  private extractRtfImages(rtf: string): { data: Uint8Array; ext: string }[] {
-    const images: { data: Uint8Array; ext: string }[] = [];
+  // ─── Strategy 3: HTML file:///blob: URLs ───────────────────
 
-    // Match {\pict ... \pngblip HEXDATA} or \jpegblip
+  private async fromHtmlUrls(html: string): Promise<SlideImage[]> {
+    const images: SlideImage[] = [];
+    // Match src="file:///..." or src="blob:..." in <img> or <v:imagedata>
+    const regex = /src=["']((?:file:\/\/\/|blob:)[^"']+)["']/gi;
+    let match;
+    const urls: string[] = [];
+
+    while ((match = regex.exec(html)) !== null) {
+      urls.push(match[1]);
+    }
+
+    for (const url of urls) {
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) continue;
+        const buf = await resp.arrayBuffer();
+        const data = new Uint8Array(buf);
+        if (data.length < 3000) continue;
+        const ct = resp.headers.get("content-type") || "image/png";
+        images.push({ data, ext: this.extFromMime(ct) });
+      } catch { /* skip */ }
+    }
+
+    return images;
+  }
+
+  // ─── Strategy 4: RTF Embedded Images ───────────────────────
+
+  private fromRtf(rtf: string): SlideImage[] {
+    const images: SlideImage[] = [];
     const regex = /\\(pngblip|jpegblip)\s*\r?\n?([0-9a-fA-F\s]+)/g;
     let match;
 
     while ((match = regex.exec(rtf)) !== null) {
       const type = match[1];
       const hex = match[2].replace(/\s/g, "");
-
-      // Must have substantial data to be a slide
-      if (hex.length < 10000) continue;
-
+      if (hex.length < 6000) continue;
       try {
         const bytes = new Uint8Array(hex.length / 2);
         for (let i = 0; i < hex.length; i += 2) {
           bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
         }
-
-        const ext = type === "jpegblip" ? "jpg" : "png";
-        images.push({ data: bytes, ext });
-      } catch {
-        // Invalid hex, skip
-      }
+        images.push({ data: bytes, ext: type === "jpegblip" ? "jpg" : "png" });
+      } catch { /* skip */ }
     }
 
     return images;
   }
 
-  private async saveAndInsertImages(
-    images: { data: Uint8Array; ext: string }[],
-    editor: any
-  ) {
+  // ─── Shared Utilities ──────────────────────────────────────
+
+  private extFromMime(mime: string): string {
+    if (mime.includes("jpeg") || mime.includes("jpg")) return "jpg";
+    if (mime.includes("gif")) return "gif";
+    if (mime.includes("webp")) return "webp";
+    return "png";
+  }
+
+  private async saveAndInsertImages(images: SlideImage[], editor: any) {
     const activeFile = this.app.workspace.getActiveFile();
     if (!activeFile) {
       new Notice("No active file");
@@ -134,20 +219,18 @@ export default class PPTSlidePaste extends Plugin {
     }
 
     const cursor = editor.getCursor();
-    editor.replaceRange(lines.join("\n\n") + "\n", cursor);
+    editor.replaceRange(lines.join("\n") + "\n", cursor);
 
     new Notice(`${images.length} slides pasted!`);
   }
 
   private async getAttachmentFolder(activeFile: TFile): Promise<string> {
     // @ts-ignore — internal API
-    const attachPath: string = this.app.vault.getConfig("attachmentFolderPath") || "/";
+    const attachPath: string =
+      this.app.vault.getConfig("attachmentFolderPath") || "/";
 
     if (attachPath === "/") return "";
-
-    if (attachPath === "./") {
-      return activeFile.parent?.path || "";
-    }
+    if (attachPath === "./") return activeFile.parent?.path || "";
 
     if (attachPath.startsWith("./")) {
       const parentPath = activeFile.parent?.path || "";
