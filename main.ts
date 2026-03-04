@@ -1,45 +1,113 @@
-import { Plugin, MarkdownView, Notice, TFile, normalizePath } from "obsidian";
+import { Plugin, Notice, TFile, normalizePath } from "obsidian";
 
 export default class PPTSlidePaste extends Plugin {
   async onload() {
     this.registerEvent(
       this.app.workspace.on("editor-paste", (evt: ClipboardEvent, editor) => {
-        const items = evt.clipboardData?.items;
-        if (!items) return;
+        if (!evt.clipboardData) return;
 
-        // Collect all image items from clipboard
-        const imageItems: DataTransferItem[] = [];
-        for (let i = 0; i < items.length; i++) {
-          if (items[i].type.startsWith("image/")) {
-            imageItems.push(items[i]);
+        // Strategy 1: Check text/html for multiple embedded base64 images (PPT's format)
+        const html = evt.clipboardData.getData("text/html");
+        if (html) {
+          const base64Images = this.extractBase64Images(html);
+          if (base64Images.length > 1) {
+            // Multiple images in HTML — this is PPT multi-slide paste
+            evt.preventDefault();
+            this.saveAndInsertImages(base64Images, editor);
+            return;
           }
         }
 
-        // Also check for HTML with embedded images (PPT often sends this)
-        let htmlContent = "";
-        for (let i = 0; i < items.length; i++) {
-          if (items[i].type === "text/html") {
-            // We'll handle this async
-            items[i].getAsString((html) => {
-              htmlContent = html;
-            });
+        // Strategy 2: Check text/rtf — PPT also embits images in RTF
+        const rtf = evt.clipboardData.getData("text/rtf");
+        if (rtf) {
+          const rtfImages = this.extractRtfImages(rtf);
+          if (rtfImages.length > 1) {
+            evt.preventDefault();
+            this.saveAndInsertImages(rtfImages, editor);
+            return;
           }
         }
 
-        // If multiple images or at least one image, intercept
-        if (imageItems.length === 0) return;
-
-        evt.preventDefault();
-
-        // Process all clipboard image blobs
-        this.handleImagePaste(imageItems, htmlContent, editor);
+        // Strategy 3: Fallback — if HTML had exactly 1 image and there's also
+        // a blob, just let Obsidian handle it normally (single image paste)
       })
     );
   }
 
-  private async handleImagePaste(
-    imageItems: DataTransferItem[],
-    _htmlContent: string,
+  /**
+   * Extract base64-encoded images from HTML clipboard content.
+   * PPT puts <img src="data:image/png;base64,..."> or
+   * <v:imagedata src="data:image/png;base64,..."> for each slide.
+   */
+  private extractBase64Images(html: string): { data: Uint8Array; ext: string }[] {
+    const images: { data: Uint8Array; ext: string }[] = [];
+
+    // Match data URI patterns: data:image/TYPE;base64,DATA
+    // These appear in src="..." or src='...'
+    const regex = /data:image\/(png|jpeg|jpg|gif|bmp|webp|emf|wmf);base64,([A-Za-z0-9+/=\s]+)/g;
+    let match;
+
+    while ((match = regex.exec(html)) !== null) {
+      const mimeSubtype = match[1];
+      const b64 = match[2].replace(/\s/g, "");
+
+      try {
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+
+        // Skip tiny images (likely icons/bullets, not slides)
+        if (bytes.length < 5000) continue;
+
+        const ext = (mimeSubtype === "jpeg" || mimeSubtype === "jpg") ? "jpg" : "png";
+        images.push({ data: bytes, ext });
+      } catch {
+        // Invalid base64, skip
+      }
+    }
+
+    return images;
+  }
+
+  /**
+   * Extract images embedded in RTF content.
+   * RTF embeds images as hex-encoded data after \pngblip or \jpegblip
+   */
+  private extractRtfImages(rtf: string): { data: Uint8Array; ext: string }[] {
+    const images: { data: Uint8Array; ext: string }[] = [];
+
+    // Match {\pict ... \pngblip HEXDATA} or \jpegblip
+    const regex = /\\(pngblip|jpegblip)\s*\r?\n?([0-9a-fA-F\s]+)/g;
+    let match;
+
+    while ((match = regex.exec(rtf)) !== null) {
+      const type = match[1];
+      const hex = match[2].replace(/\s/g, "");
+
+      // Must have substantial data to be a slide
+      if (hex.length < 10000) continue;
+
+      try {
+        const bytes = new Uint8Array(hex.length / 2);
+        for (let i = 0; i < hex.length; i += 2) {
+          bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+        }
+
+        const ext = type === "jpegblip" ? "jpg" : "png";
+        images.push({ data: bytes, ext });
+      } catch {
+        // Invalid hex, skip
+      }
+    }
+
+    return images;
+  }
+
+  private async saveAndInsertImages(
+    images: { data: Uint8Array; ext: string }[],
     editor: any
   ) {
     const activeFile = this.app.workspace.getActiveFile();
@@ -48,90 +116,55 @@ export default class PPTSlidePaste extends Plugin {
       return;
     }
 
-    // Get attachment folder path
     const attachFolder = await this.getAttachmentFolder(activeFile);
-
-    const blobs: Blob[] = [];
-    for (const item of imageItems) {
-      const blob = item.getAsFile();
-      if (blob) blobs.push(blob);
-    }
-
-    if (blobs.length === 0) {
-      new Notice("No images found in clipboard");
-      return;
-    }
-
-    new Notice(`Pasting ${blobs.length} slide image${blobs.length > 1 ? "s" : ""}...`);
-
-    const lines: string[] = [];
     const timestamp = Date.now();
+    const lines: string[] = [];
 
-    for (let i = 0; i < blobs.length; i++) {
-      const blob = blobs[i];
-      const ext = this.getExtension(blob.type);
-      const fileName = `slide-${timestamp}-${String(i + 1).padStart(2, "0")}.${ext}`;
-      const filePath = normalizePath(`${attachFolder}/${fileName}`);
+    new Notice(`Pasting ${images.length} slide images...`);
 
-      // Read blob as ArrayBuffer and save
-      const buffer = await blob.arrayBuffer();
-      await this.app.vault.createBinary(filePath, buffer);
+    for (let i = 0; i < images.length; i++) {
+      const img = images[i];
+      const fileName = `slide-${timestamp}-${String(i + 1).padStart(2, "0")}.${img.ext}`;
+      const filePath = normalizePath(
+        attachFolder ? `${attachFolder}/${fileName}` : fileName
+      );
 
-      // Build markdown image embed
+      await this.app.vault.createBinary(filePath, img.data.buffer);
       lines.push(`![[${fileName}]]`);
     }
 
-    // Insert all image embeds at cursor
     const cursor = editor.getCursor();
-    const insertText = lines.join("\n\n") + "\n";
-    editor.replaceRange(insertText, cursor);
+    editor.replaceRange(lines.join("\n\n") + "\n", cursor);
 
-    new Notice(`${blobs.length} slide${blobs.length > 1 ? "s" : ""} pasted!`);
-  }
-
-  private getExtension(mimeType: string): string {
-    if (mimeType === "image/png") return "png";
-    if (mimeType === "image/jpeg") return "jpg";
-    if (mimeType === "image/gif") return "gif";
-    if (mimeType === "image/webp") return "webp";
-    if (mimeType === "image/bmp") return "bmp";
-    if (mimeType === "image/svg+xml") return "svg";
-    return "png";
+    new Notice(`${images.length} slides pasted!`);
   }
 
   private async getAttachmentFolder(activeFile: TFile): Promise<string> {
-    // Respect Obsidian's attachment folder setting
     // @ts-ignore — internal API
-    const attachPath = this.app.vault.getConfig("attachmentFolderPath");
+    const attachPath: string = this.app.vault.getConfig("attachmentFolderPath") || "/";
 
-    if (!attachPath || attachPath === "/") {
-      // Root of vault
-      return "";
-    }
+    if (attachPath === "/") return "";
 
     if (attachPath === "./") {
-      // Same folder as current file
       return activeFile.parent?.path || "";
     }
 
     if (attachPath.startsWith("./")) {
-      // Subfolder relative to current file
       const parentPath = activeFile.parent?.path || "";
-      const subFolder = attachPath.slice(2);
-      const fullPath = parentPath ? `${parentPath}/${subFolder}` : subFolder;
-      await this.ensureFolder(fullPath);
-      return fullPath;
+      const sub = attachPath.slice(2);
+      const full = parentPath ? `${parentPath}/${sub}` : sub;
+      await this.ensureFolder(full);
+      return full;
     }
 
-    // Absolute path in vault
     await this.ensureFolder(attachPath);
     return attachPath;
   }
 
   private async ensureFolder(path: string) {
-    const normalPath = normalizePath(path);
-    if (!this.app.vault.getAbstractFileByPath(normalPath)) {
-      await this.app.vault.createFolder(normalPath);
+    const p = normalizePath(path);
+    if (!this.app.vault.getAbstractFileByPath(p)) {
+      await this.app.vault.createFolder(p);
     }
   }
 }
