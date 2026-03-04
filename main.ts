@@ -7,7 +7,7 @@ interface SlideImage {
 
 export default class PPTSlidePaste extends Plugin {
   async onload() {
-    console.log("[PPT Paste] Plugin loaded v1.3.0");
+    console.log("[PPT Paste] Plugin loaded v1.4.0");
 
     this.registerEvent(
       this.app.workspace.on("editor-paste", (evt: ClipboardEvent, editor) => {
@@ -15,188 +15,269 @@ export default class PPTSlidePaste extends Plugin {
 
         const cd = evt.clipboardData;
         const types = Array.from(cd.types);
-        const html = cd.getData("text/html");
-        const rtf = cd.getData("text/rtf");
-        const svg = cd.getData("image/svg+xml");
+        const isPpt = types.includes("ppt/slides");
 
-        console.log("[PPT Paste] === Paste event ===");
+        // ── Diagnostic logging ──
+        console.log("[PPT Paste] === Paste ===");
         console.log("[PPT Paste] types:", types.join(", "));
-        console.log(
-          "[PPT Paste] files:",
-          cd.files.length,
-          Array.from({ length: cd.files.length }, (_, i) =>
-            `${cd.files[i].type}(${cd.files[i].size}b)`
-          ).join(", ")
-        );
-        console.log("[PPT Paste] html:", html.length, "| rtf:", rtf.length, "| svg:", svg.length);
-        if (svg.length > 0) {
-          console.log("[PPT Paste] svg preview:", svg.substring(0, 3000));
+        for (let i = 0; i < cd.items.length; i++) {
+          const item = cd.items[i];
+          if (item.kind === "file") {
+            const f = item.getAsFile();
+            console.log(`[PPT Paste] item[${i}] FILE type=${item.type} size=${f?.size}`);
+          } else {
+            console.log(`[PPT Paste] item[${i}] STRING type=${item.type}`);
+          }
         }
 
-        const isPpt = types.includes("ppt/slides");
-        const hasMulti = this.hasMultipleImages(cd, html, rtf, svg);
+        const html = cd.getData("text/html");
+        const rtf = cd.getData("text/rtf");
+        console.log("[PPT Paste] html:%d rtf:%d files:%d isPpt:%s",
+          html.length, rtf.length, cd.files.length, isPpt);
+
+        // ── Collect File objects synchronously (persist after event) ──
+        const collectedFiles: File[] = [];
+        for (let i = 0; i < cd.items.length; i++) {
+          if (cd.items[i].kind === "file") {
+            const f = cd.items[i].getAsFile();
+            if (f) collectedFiles.push(f);
+          }
+        }
+
+        // ── Decide whether to intercept ──
+        const hasMulti = this.hasMultipleImages(cd, html, rtf);
 
         if (!isPpt && !hasMulti) {
-          console.log("[PPT Paste] Not PPT / not multi-image → pass through");
+          console.log("[PPT Paste] Not PPT / not multi → pass through");
           return;
         }
 
-        console.log("[PPT Paste] Intercepting (isPpt=%s, hasMulti=%s)", isPpt, hasMulti);
+        console.log("[PPT Paste] Intercepting (isPpt=%s hasMulti=%s)", isPpt, hasMulti);
         evt.preventDefault();
-        this.extractAndInsert(cd, html, rtf, svg, isPpt, editor);
+        this.handlePaste(html, rtf, collectedFiles, isPpt, editor);
       })
     );
   }
 
   // ─── Detection ─────────────────────────────────────────────
 
-  private hasMultipleImages(
-    cd: DataTransfer,
-    html: string,
-    rtf: string,
-    svg: string
-  ): boolean {
-    // 1. Multiple image files
+  private hasMultipleImages(cd: DataTransfer, html: string, rtf: string): boolean {
     let fileCount = 0;
     for (let i = 0; i < cd.files.length; i++) {
       if (cd.files[i].type.startsWith("image/") && cd.files[i].size >= 3000)
         fileCount++;
     }
-    if (fileCount > 1) {
-      console.log("[PPT Paste] detect: files =", fileCount);
-      return true;
-    }
+    if (fileCount > 1) return true;
 
-    // 2. SVG with multiple embedded images
-    if (svg) {
-      const svgImageTags = (svg.match(/<image[\s>]/gi) || []).length;
-      if (svgImageTags > 1) {
-        console.log("[PPT Paste] detect: SVG <image> =", svgImageTags);
-        return true;
-      }
-      const svgDataUris = (svg.match(/data:image\/[\w+]+;base64,/gi) || []).length;
-      if (svgDataUris > 1) {
-        console.log("[PPT Paste] detect: SVG data URIs =", svgDataUris);
-        return true;
-      }
-    }
-
-    // 3. HTML checks
     if (html) {
-      const imgTags = (html.match(/<img[\s>]/gi) || []).length;
-      if (imgTags > 1) return true;
-
-      const dataUris = (html.match(/data:image\/[\w+]+;base64,/gi) || []).length;
-      if (dataUris > 1) return true;
-
-      const srcRefs = (
-        html.match(
-          /src=["'][^"']*\.(?:png|jpg|jpeg|gif|bmp|emf|wmf|tif|tiff)/gi
-        ) || []
-      ).length;
-      if (srcRefs > 1) return true;
-
-      const vmlImages = (html.match(/<v:imagedata[\s>]/gi) || []).length;
-      if (vmlImages > 1) return true;
-
-      const clipImages = new Set(html.match(/clip_image\d+/gi) || []).size;
-      if (clipImages > 1) return true;
+      if ((html.match(/<img[\s>]/gi) || []).length > 1) return true;
+      if ((html.match(/data:image\/[\w+]+;base64,/gi) || []).length > 1) return true;
+      if ((html.match(/src=["'][^"']*\.(?:png|jpg|jpeg|gif|bmp|emf|wmf)/gi) || []).length > 1) return true;
+      if ((html.match(/<v:imagedata[\s>]/gi) || []).length > 1) return true;
+      if (new Set(html.match(/clip_image\d+/gi) || []).size > 1) return true;
     }
 
-    // 4. RTF blip markers
     if (rtf) {
-      const rtfImages = (
-        rtf.match(/\\(pngblip|jpegblip|emfblip)/g) || []
-      ).length;
-      if (rtfImages > 1) return true;
+      if ((rtf.match(/\\(pngblip|jpegblip|emfblip)/g) || []).length > 1) return true;
     }
 
-    console.log("[PPT Paste] detect: no multi-image signals");
     return false;
   }
 
-  // ─── Extraction orchestrator ───────────────────────────────
+  // ─── Main extraction flow ──────────────────────────────────
 
-  private async extractAndInsert(
-    cd: DataTransfer,
+  private async handlePaste(
     html: string,
     rtf: string,
-    svg: string,
+    collectedFiles: File[],
     isPpt: boolean,
     editor: any
   ) {
     const candidates: SlideImage[][] = [];
 
-    // Strategy 1: SVG embedded base64 images (PPT primary path)
+    // ── Phase 1: Get SVG data (PPT primary path) ──
+    let svg = "";
+    if (isPpt) {
+      svg = await this.obtainSvg(collectedFiles);
+    }
+
+    // ── Phase 2: Try all extraction strategies ──
+
+    // S1: SVG embedded base64 images
     if (svg) {
       const s1 = this.fromSvgBase64(svg);
       console.log("[PPT Paste] S1 SVG base64:", s1.length);
       candidates.push(s1);
     }
 
-    // Strategy 2: Clipboard files
-    const s2 = await this.fromFiles(cd);
-    console.log("[PPT Paste] S2 files:", s2.length);
-    candidates.push(s2);
+    // S2: SVG href URLs (file:/// paths)
+    if (svg) {
+      const s2 = await this.fromSvgUrls(svg);
+      console.log("[PPT Paste] S2 SVG URLs:", s2.length);
+      candidates.push(s2);
+    }
 
-    // Strategy 3: HTML base64 data URIs
-    if (html) {
-      const s3 = this.fromHtmlBase64(html);
-      console.log("[PPT Paste] S3 HTML base64:", s3.length);
+    // S3: SVG render individual slides (if SVG is vector, not raster)
+    if (svg && candidates.every(c => c.length <= 1)) {
+      const s3 = await this.fromSvgRender(svg);
+      console.log("[PPT Paste] S3 SVG render:", s3.length);
       candidates.push(s3);
     }
 
-    // Strategy 4: HTML src URLs → Node.js fs
-    if (html) {
-      const s4 = await this.fromHtmlUrls(html);
-      console.log("[PPT Paste] S4 HTML URLs:", s4.length);
-      candidates.push(s4);
-    }
+    // S4: Collected image files
+    const imageFiles = await this.fromCollectedFiles(collectedFiles);
+    console.log("[PPT Paste] S4 files:", imageFiles.length);
+    candidates.push(imageFiles);
 
-    // Strategy 5: RTF embedded images
-    if (rtf) {
-      const s5 = this.fromRtf(rtf);
-      console.log("[PPT Paste] S5 RTF:", s5.length);
+    // S5: HTML base64
+    if (html) {
+      const s5 = this.fromGenericBase64(html);
+      console.log("[PPT Paste] S5 HTML base64:", s5.length);
       candidates.push(s5);
     }
 
-    // Strategy 6: SVG src/href URLs → Node.js fs
-    if (svg) {
-      const s6 = await this.fromSvgUrls(svg);
-      console.log("[PPT Paste] S6 SVG URLs:", s6.length);
+    // S6: HTML URLs
+    if (html) {
+      const s6 = await this.fromHtmlUrls(html);
+      console.log("[PPT Paste] S6 HTML URLs:", s6.length);
       candidates.push(s6);
     }
 
-    // Pick the strategy with the most images
+    // S7: RTF
+    if (rtf) {
+      const s7 = this.fromRtf(rtf);
+      console.log("[PPT Paste] S7 RTF:", s7.length);
+      candidates.push(s7);
+    }
+
+    // ── Phase 3: Pick best result ──
     let images = candidates.reduce(
       (best, curr) => (curr.length > best.length ? curr : best),
       [] as SlideImage[]
     );
 
-    console.log("[PPT Paste] Best:", images.length, "images");
-
-    // Fallback for PPT: if no multi-image found, paste the single file
-    if (images.length === 0 && isPpt && cd.files.length > 0) {
-      console.log("[PPT Paste] PPT fallback: pasting single file");
-      images = await this.fromFiles(cd, /* allowSmall */ true);
+    // Fallback: at least paste the single file
+    if (images.length === 0 && imageFiles.length > 0) {
+      console.log("[PPT Paste] Fallback: single file");
+      images = imageFiles;
     }
+
+    console.log("[PPT Paste] Final:", images.length, "images");
 
     if (images.length > 0) {
       await this.saveAndInsertImages(images, editor);
     } else {
-      new Notice(
-        "Could not extract slide images.\nOpen console (Ctrl+Shift+I) for diagnostics."
-      );
-      console.log("[PPT Paste] FAILED — no images from any strategy");
+      new Notice("Could not extract slides.\nCheck console (Ctrl+Shift+I).");
+      console.log("[PPT Paste] FAILED — all strategies returned 0");
     }
   }
 
-  // ─── Strategy 1: SVG Embedded Base64 ──────────────────────
+  // ─── SVG Data Acquisition ─────────────────────────────────
+
+  /**
+   * Try multiple methods to read SVG from clipboard.
+   * DataTransfer.getData("image/svg+xml") returns "" because
+   * the web API only supports text/plain, text/html, etc.
+   */
+  private async obtainSvg(collectedFiles: File[]): Promise<string> {
+    let svg = "";
+
+    // Method 1: Electron clipboard API (most reliable)
+    svg = this.readSvgViaElectron();
+    if (svg) return svg;
+
+    // Method 2: SVG file from collected items
+    for (const file of collectedFiles) {
+      if (file.type === "image/svg+xml") {
+        try {
+          svg = await file.text();
+          console.log("[PPT Paste] SVG from File.text():", svg.length, "chars");
+          if (svg) return svg;
+        } catch (e) {
+          console.log("[PPT Paste] File.text() error:", e);
+        }
+      }
+    }
+
+    // Method 3: navigator.clipboard.read()
+    svg = await this.readSvgViaNavigator();
+    if (svg) return svg;
+
+    console.log("[PPT Paste] SVG: all methods failed");
+    return "";
+  }
+
+  private readSvgViaElectron(): string {
+    try {
+      const electron = require("electron");
+      const clipboard =
+        electron.clipboard ||
+        (electron.remote && electron.remote.clipboard);
+      if (!clipboard) {
+        console.log("[PPT Paste] Electron clipboard not available");
+        return "";
+      }
+
+      const formats: string[] = clipboard.availableFormats();
+      console.log("[PPT Paste] Electron formats:", formats.join(", "));
+
+      // Find SVG format
+      const svgFmt = formats.find(
+        (f: string) => f.includes("svg") || f === "image/svg+xml"
+      );
+      if (svgFmt) {
+        const buf: Buffer = clipboard.readBuffer(svgFmt);
+        if (buf && buf.length > 0) {
+          const svg = buf.toString("utf-8");
+          console.log("[PPT Paste] Electron SVG (%s):", svgFmt, svg.length, "chars");
+          if (svg.length > 0 && svg.length < 50000) {
+            console.log("[PPT Paste] SVG content:", svg);
+          } else {
+            console.log("[PPT Paste] SVG preview:", svg.substring(0, 5000));
+          }
+          return svg;
+        }
+      }
+
+      // Log all format sizes for debugging
+      for (const fmt of formats) {
+        try {
+          const buf: Buffer = clipboard.readBuffer(fmt);
+          console.log(`[PPT Paste] format '${fmt}': ${buf.length} bytes`);
+        } catch {}
+      }
+    } catch (e) {
+      console.log("[PPT Paste] Electron error:", e);
+    }
+    return "";
+  }
+
+  private async readSvgViaNavigator(): Promise<string> {
+    try {
+      const items = await (navigator as any).clipboard.read();
+      for (const item of items) {
+        console.log("[PPT Paste] navigator.clipboard types:", item.types.join(", "));
+        if (item.types.includes("image/svg+xml")) {
+          const blob = await item.getType("image/svg+xml");
+          const text = await blob.text();
+          console.log("[PPT Paste] navigator.clipboard SVG:", text.length, "chars");
+          return text;
+        }
+      }
+    } catch (e) {
+      console.log("[PPT Paste] navigator.clipboard error:", e);
+    }
+    return "";
+  }
+
+  // ─── S1: SVG Embedded Base64 ──────────────────────────────
 
   private fromSvgBase64(svg: string): SlideImage[] {
     const images: SlideImage[] = [];
+
     // Match href="data:image/..." or xlink:href="data:image/..."
-    const regex = /(?:xlink:)?href=["'](data:image\/([\w+]+);base64,([A-Za-z0-9+/=\s]+))["']/g;
+    const regex =
+      /(?:xlink:)?href=["'](data:image\/([\w+]+);base64,([A-Za-z0-9+/=\s]+))["']/g;
     let match;
 
     while ((match = regex.exec(svg)) !== null) {
@@ -211,11 +292,11 @@ export default class PPTSlidePaste extends Plugin {
         if (bytes.length < 3000) continue;
         images.push({ data: bytes, ext: this.extFromMime(`image/${mimeType}`) });
       } catch (e) {
-        console.log("[PPT Paste] S1 decode error:", e);
+        console.log("[PPT Paste] S1 error:", e);
       }
     }
 
-    // Fallback: also try the generic data URI pattern (no href wrapper)
+    // Fallback: generic data URI search (no href wrapper)
     if (images.length === 0) {
       return this.fromGenericBase64(svg);
     }
@@ -223,11 +304,10 @@ export default class PPTSlidePaste extends Plugin {
     return images;
   }
 
-  // ─── Strategy 6: SVG URL References ───────────────────────
+  // ─── S2: SVG URL References ───────────────────────────────
 
   private async fromSvgUrls(svg: string): Promise<SlideImage[]> {
     const images: SlideImage[] = [];
-    // Match href="file:///..." or xlink:href="file:///..."
     const regex = /(?:xlink:)?href=["']((?:file:\/\/\/)[^"']+)["']/gi;
     let match;
     const urls: string[] = [];
@@ -236,51 +316,180 @@ export default class PPTSlidePaste extends Plugin {
       urls.push(match[1]);
     }
 
-    if (urls.length > 0) {
-      console.log("[PPT Paste] S6 SVG URLs found:", urls.length);
-    }
-
     for (const url of urls) {
       try {
         const data = this.readLocalFile(url);
         if (data && data.length >= 3000) {
           images.push({ data, ext: this.extFromPath(url) });
         }
-      } catch (e) {
-        console.log("[PPT Paste] S6 error:", e);
-      }
+      } catch {}
     }
 
     return images;
   }
 
-  // ─── Strategy 2: Clipboard Files ──────────────────────────
+  // ─── S3: SVG Render (vector → raster per slide) ──────────
 
-  private async fromFiles(
-    cd: DataTransfer,
-    allowSmall = false
-  ): Promise<SlideImage[]> {
+  /**
+   * If SVG contains vector slides (not raster), render each
+   * top-level group as a separate PNG using OffscreenCanvas.
+   */
+  private async fromSvgRender(svg: string): Promise<SlideImage[]> {
     const images: SlideImage[] = [];
-    for (let i = 0; i < cd.files.length; i++) {
-      const file = cd.files[i];
-      if (!file.type.startsWith("image/")) continue;
+
+    try {
+      // Parse SVG to find viewBox and top-level groups
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(svg, "image/svg+xml");
+      const svgEl = doc.querySelector("svg");
+      if (!svgEl) return images;
+
+      // Get SVG dimensions
+      const vb = svgEl.getAttribute("viewBox");
+      const width = parseFloat(svgEl.getAttribute("width") || "0");
+      const height = parseFloat(svgEl.getAttribute("height") || "0");
+
+      console.log("[PPT Paste] S3 SVG viewBox:", vb, "w:", width, "h:", height);
+
+      // Find top-level groups — each might be a slide
+      const groups = svgEl.querySelectorAll(":scope > g");
+      console.log("[PPT Paste] S3 top-level <g>:", groups.length);
+
+      if (groups.length <= 1) return images;
+
+      // Try to detect slide layout from group transforms
+      // Each slide group should have a transform that positions it
+      const slideGroups: Element[] = [];
+      groups.forEach((g) => {
+        // Only include groups that have visual content
+        const hasContent =
+          g.querySelector("image, rect, path, text, polygon, polyline, circle, ellipse, line");
+        if (hasContent) slideGroups.push(g);
+      });
+
+      console.log("[PPT Paste] S3 visual groups:", slideGroups.length);
+      if (slideGroups.length <= 1) return images;
+
+      // Render each group as a separate image
+      // Calculate per-slide dimensions from viewBox
+      let slideW = width || 960;
+      let slideH = height || 540;
+
+      if (vb) {
+        const parts = vb.split(/[\s,]+/).map(Number);
+        if (parts.length === 4) {
+          const totalW = parts[2];
+          const totalH = parts[3];
+          // Heuristic: if height >> width, slides are stacked vertically
+          if (totalH / totalW > 1.5) {
+            slideW = totalW;
+            slideH = totalW * 0.5625; // 16:9 aspect ratio
+          } else {
+            slideW = totalW;
+            slideH = totalH;
+          }
+        }
+      }
+
+      for (let i = 0; i < slideGroups.length; i++) {
+        try {
+          const groupSvg = this.wrapGroupAsSvg(
+            svgEl,
+            slideGroups[i],
+            slideW,
+            slideH
+          );
+          const png = await this.svgToPng(groupSvg, slideW, slideH);
+          if (png && png.length >= 3000) {
+            images.push({ data: png, ext: "png" });
+          }
+        } catch (e) {
+          console.log("[PPT Paste] S3 render error for group", i, ":", e);
+        }
+      }
+    } catch (e) {
+      console.log("[PPT Paste] S3 error:", e);
+    }
+
+    return images;
+  }
+
+  private wrapGroupAsSvg(
+    originalSvg: SVGSVGElement,
+    group: Element,
+    w: number,
+    h: number
+  ): string {
+    // Create a standalone SVG with just this group
+    const ns = originalSvg.getAttribute("xmlns") || "http://www.w3.org/2000/svg";
+    const xlinkNs = "http://www.w3.org/1999/xlink";
+
+    // Clone the defs (gradients, patterns, clip paths)
+    const defs = originalSvg.querySelector("defs");
+    const defsStr = defs ? defs.outerHTML : "";
+
+    return `<svg xmlns="${ns}" xmlns:xlink="${xlinkNs}" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">${defsStr}${group.outerHTML}</svg>`;
+  }
+
+  private svgToPng(svgString: string, w: number, h: number): Promise<Uint8Array | null> {
+    return new Promise((resolve) => {
+      const img = new Image();
+      const blob = new Blob([svgString], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+
+      img.onload = () => {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.min(w, 1920);
+          canvas.height = Math.min(h, 1080);
+          const ctx = canvas.getContext("2d");
+          if (!ctx) { resolve(null); return; }
+
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+          canvas.toBlob(
+            (pngBlob) => {
+              if (!pngBlob) { resolve(null); return; }
+              pngBlob.arrayBuffer().then((buf) => {
+                resolve(new Uint8Array(buf));
+              });
+            },
+            "image/png"
+          );
+        } catch (e) {
+          console.log("[PPT Paste] canvas error:", e);
+          resolve(null);
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      };
+
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve(null);
+      };
+
+      img.src = url;
+    });
+  }
+
+  // ─── S4: Collected Files ──────────────────────────────────
+
+  private async fromCollectedFiles(files: File[]): Promise<SlideImage[]> {
+    const images: SlideImage[] = [];
+    for (const file of files) {
+      if (!file.type.startsWith("image/") || file.type === "image/svg+xml") continue;
       try {
         const buf = await file.arrayBuffer();
         const data = new Uint8Array(buf);
-        if (!allowSmall && data.length < 3000) continue;
+        if (data.length < 3000) continue;
         images.push({ data, ext: this.extFromMime(file.type) });
-      } catch (e) {
-        console.log("[PPT Paste] S2 error:", e);
-      }
+      } catch {}
     }
     return images;
   }
 
-  // ─── Strategy 3: HTML Base64 Data URIs ────────────────────
-
-  private fromHtmlBase64(html: string): SlideImage[] {
-    return this.fromGenericBase64(html);
-  }
+  // ─── S5: Generic Base64 Data URIs ─────────────────────────
 
   private fromGenericBase64(text: string): SlideImage[] {
     const images: SlideImage[] = [];
@@ -297,19 +506,14 @@ export default class PPTSlidePaste extends Plugin {
           bytes[i] = binary.charCodeAt(i);
         }
         if (bytes.length < 3000) continue;
-        images.push({
-          data: bytes,
-          ext: this.extFromMime(`image/${mimeType}`),
-        });
-      } catch (e) {
-        console.log("[PPT Paste] base64 decode error:", e);
-      }
+        images.push({ data: bytes, ext: this.extFromMime(`image/${mimeType}`) });
+      } catch {}
     }
 
     return images;
   }
 
-  // ─── Strategy 4: HTML src URLs → Node.js fs ───────────────
+  // ─── S6: HTML src URLs ────────────────────────────────────
 
   private async fromHtmlUrls(html: string): Promise<SlideImage[]> {
     const images: SlideImage[] = [];
@@ -318,22 +522,13 @@ export default class PPTSlidePaste extends Plugin {
     const urls: string[] = [];
 
     while ((match = regex.exec(html)) !== null) {
-      const url = match[1];
-      if (url.startsWith("data:")) continue;
-      urls.push(url);
-    }
-
-    if (urls.length > 0) {
-      console.log(
-        "[PPT Paste] S4 URLs:",
-        urls.length,
-        urls.map((u) => u.substring(0, 120))
-      );
+      if (match[1].startsWith("data:")) continue;
+      urls.push(match[1]);
     }
 
     for (const url of urls) {
       try {
-        if (url.startsWith("file:///") || url.startsWith("file://")) {
+        if (url.startsWith("file:///")) {
           const data = this.readLocalFile(url);
           if (data && data.length >= 3000) {
             images.push({ data, ext: this.extFromPath(url) });
@@ -344,12 +539,9 @@ export default class PPTSlidePaste extends Plugin {
           const buf = await resp.arrayBuffer();
           const data = new Uint8Array(buf);
           if (data.length < 3000) continue;
-          const ct = resp.headers.get("content-type") || "image/png";
-          images.push({ data, ext: this.extFromMime(ct) });
+          images.push({ data, ext: this.extFromMime(resp.headers.get("content-type") || "image/png") });
         }
-      } catch (e) {
-        console.log("[PPT Paste] S4 error:", url.substring(0, 80), e);
-      }
+      } catch {}
     }
 
     return images;
@@ -359,15 +551,11 @@ export default class PPTSlidePaste extends Plugin {
     try {
       let filePath: string;
       try {
-        const urlMod = require("url");
-        filePath = urlMod.fileURLToPath(fileUrl);
+        filePath = require("url").fileURLToPath(fileUrl);
       } catch {
         filePath = decodeURIComponent(fileUrl.replace(/^file:\/\/\//, ""));
       }
-
-      console.log("[PPT Paste] Reading:", filePath);
-      const fs = require("fs");
-      const buffer: Buffer = fs.readFileSync(filePath);
+      const buffer: Buffer = require("fs").readFileSync(filePath);
       return Uint8Array.from(buffer);
     } catch (e) {
       console.log("[PPT Paste] fs read failed:", e);
@@ -375,7 +563,7 @@ export default class PPTSlidePaste extends Plugin {
     }
   }
 
-  // ─── Strategy 5: RTF Embedded Images ──────────────────────
+  // ─── S7: RTF Embedded Images ──────────────────────────────
 
   private fromRtf(rtf: string): SlideImage[] {
     const images: SlideImage[] = [];
@@ -398,13 +586,8 @@ export default class PPTSlidePaste extends Plugin {
           for (let i = 0; i < hex.length; i += 2) {
             bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
           }
-          images.push({
-            data: bytes,
-            ext: blipType === "jpegblip" ? "jpg" : "png",
-          });
-        } catch (e) {
-          console.log("[PPT Paste] S5 decode error:", e);
-        }
+          images.push({ data: bytes, ext: blipType === "jpegblip" ? "jpg" : "png" });
+        } catch {}
       }
     }
 
@@ -417,21 +600,13 @@ export default class PPTSlidePaste extends Plugin {
 
     while (i < limit) {
       const ch = rtf[i];
-
       if (ch === "}") return null;
-
-      if (ch === " " || ch === "\r" || ch === "\n" || ch === "\t") {
-        i++;
-        continue;
-      }
+      if (ch === " " || ch === "\r" || ch === "\n" || ch === "\t") { i++; continue; }
 
       if (ch === "\\") {
         i++;
         while (i < limit && rtf[i] >= "a" && rtf[i] <= "z") i++;
-        if (
-          i < limit &&
-          (rtf[i] === "-" || (rtf[i] >= "0" && rtf[i] <= "9"))
-        ) {
+        if (i < limit && (rtf[i] === "-" || (rtf[i] >= "0" && rtf[i] <= "9"))) {
           if (rtf[i] === "-") i++;
           while (i < limit && rtf[i] >= "0" && rtf[i] <= "9") i++;
         }
@@ -439,48 +614,33 @@ export default class PPTSlidePaste extends Plugin {
         continue;
       }
 
-      if (this.isHexChar(ch)) {
+      if (this.isHex(ch)) {
         let hexCount = 0;
         let j = i;
         while (j < rtf.length) {
           const c = rtf[j];
-          if (this.isHexChar(c)) {
-            hexCount++;
-            j++;
-          } else if (c === " " || c === "\r" || c === "\n" || c === "\t") {
-            j++;
-          } else {
-            break;
-          }
+          if (this.isHex(c)) { hexCount++; j++; }
+          else if (c === " " || c === "\r" || c === "\n" || c === "\t") { j++; }
+          else break;
         }
-
         if (hexCount >= 100) {
-          const endPos = Math.min(
-            j,
-            rtf.indexOf("}", i) === -1 ? j : rtf.indexOf("}", i)
-          );
+          const endPos = Math.min(j, rtf.indexOf("}", i) === -1 ? j : rtf.indexOf("}", i));
           return rtf.substring(i, endPos).replace(/[\s\r\n]/g, "");
         }
-
         i = j;
         continue;
       }
 
       i++;
     }
-
     return null;
   }
 
-  private isHexChar(ch: string): boolean {
-    return (
-      (ch >= "0" && ch <= "9") ||
-      (ch >= "a" && ch <= "f") ||
-      (ch >= "A" && ch <= "F")
-    );
+  private isHex(ch: string): boolean {
+    return (ch >= "0" && ch <= "9") || (ch >= "a" && ch <= "f") || (ch >= "A" && ch <= "F");
   }
 
-  // ─── Shared Utilities ──────────────────────────────────────
+  // ─── Utilities ────────────────────────────────────────────
 
   private extFromMime(mime: string): string {
     if (mime.includes("jpeg") || mime.includes("jpg")) return "jpg";
@@ -489,70 +649,56 @@ export default class PPTSlidePaste extends Plugin {
     return "png";
   }
 
-  private extFromPath(filePath: string): string {
-    const m = filePath.match(/\.(png|jpg|jpeg|gif|webp)$/i);
+  private extFromPath(p: string): string {
+    const m = p.match(/\.(png|jpg|jpeg|gif|webp)$/i);
     if (!m) return "png";
-    const ext = m[1].toLowerCase();
-    return ext === "jpeg" ? "jpg" : ext;
+    return m[1].toLowerCase() === "jpeg" ? "jpg" : m[1].toLowerCase();
   }
 
   private async saveAndInsertImages(images: SlideImage[], editor: any) {
     const activeFile = this.app.workspace.getActiveFile();
-    if (!activeFile) {
-      new Notice("No active file");
-      return;
-    }
+    if (!activeFile) { new Notice("No active file"); return; }
 
     const attachFolder = await this.getAttachmentFolder(activeFile);
-    const timestamp = Date.now();
+    const ts = Date.now();
     const lines: string[] = [];
 
     new Notice(`Pasting ${images.length} slide images...`);
 
     for (let i = 0; i < images.length; i++) {
       const img = images[i];
-      const fileName = `slide-${timestamp}-${String(i + 1).padStart(2, "0")}.${img.ext}`;
+      const fileName = `slide-${ts}-${String(i + 1).padStart(2, "0")}.${img.ext}`;
       const filePath = normalizePath(
         attachFolder ? `${attachFolder}/${fileName}` : fileName
       );
 
-      const buf =
-        img.data.buffer.byteLength === img.data.byteLength
-          ? img.data.buffer
-          : img.data.buffer.slice(
-              img.data.byteOffset,
-              img.data.byteOffset + img.data.byteLength
-            );
+      const buf = img.data.buffer.byteLength === img.data.byteLength
+        ? img.data.buffer
+        : img.data.buffer.slice(img.data.byteOffset, img.data.byteOffset + img.data.byteLength);
 
       await this.app.vault.createBinary(filePath, buf);
       lines.push(`![[${fileName}]]`);
     }
 
-    const cursor = editor.getCursor();
-    editor.replaceRange(lines.join("\n") + "\n", cursor);
-
+    editor.replaceRange(lines.join("\n") + "\n", editor.getCursor());
     new Notice(`${images.length} slides pasted!`);
-    console.log("[PPT Paste] Done:", images.length, "images inserted");
+    console.log("[PPT Paste] Done:", images.length, "images");
   }
 
   private async getAttachmentFolder(activeFile: TFile): Promise<string> {
     // @ts-ignore — internal API
-    const attachPath: string =
-      this.app.vault.getConfig("attachmentFolderPath") || "/";
-
-    if (attachPath === "/") return "";
-    if (attachPath === "./") return activeFile.parent?.path || "";
-
-    if (attachPath.startsWith("./")) {
-      const parentPath = activeFile.parent?.path || "";
-      const sub = attachPath.slice(2);
-      const full = parentPath ? `${parentPath}/${sub}` : sub;
+    const p: string = this.app.vault.getConfig("attachmentFolderPath") || "/";
+    if (p === "/") return "";
+    if (p === "./") return activeFile.parent?.path || "";
+    if (p.startsWith("./")) {
+      const parent = activeFile.parent?.path || "";
+      const sub = p.slice(2);
+      const full = parent ? `${parent}/${sub}` : sub;
       await this.ensureFolder(full);
       return full;
     }
-
-    await this.ensureFolder(attachPath);
-    return attachPath;
+    await this.ensureFolder(p);
+    return p;
   }
 
   private async ensureFolder(path: string) {

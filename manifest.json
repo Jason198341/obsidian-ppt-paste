@@ -1,7 +1,7 @@
 {
   "id": "ppt-paste",
   "name": "PPT Slide Paste",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "minAppVersion": "1.0.0",
   "description": "Paste multiple PowerPoint slides as individual images. Copy slides from PowerPoint, paste in Obsidian — each slide becomes an embedded image.",
   "author": "Jason Moon",
