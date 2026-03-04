@@ -1,0 +1,16 @@
+{
+  "name": "obsidian-ppt-paste",
+  "version": "1.0.0",
+  "description": "Paste PowerPoint slides as images into Obsidian",
+  "main": "main.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.2",
+    "obsidian": "latest",
+    "@types/node": "^22.0.0",
+    "typescript": "5.8.3"
+  }
+}
